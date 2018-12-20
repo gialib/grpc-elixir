@@ -43,7 +43,7 @@ defmodule GRPC.Integration.ServerTest do
 
       Enum.each([rectangle.lo, rectangle.hi], fn point ->
         feature = simple_feature(point)
-        Server.stream_send(stream, feature)
+        Server.send_reply(stream, feature)
       end)
     end
 
@@ -68,7 +68,7 @@ defmodule GRPC.Integration.ServerTest do
 
       Enum.each([rectangle.lo, rectangle.hi], fn point ->
         feature = simple_feature(point)
-        GRPC.Server.stream_send(stream, feature)
+        GRPC.Server.send_reply(stream, feature)
       end)
     end
 
@@ -96,10 +96,10 @@ defmodule GRPC.Integration.ServerTest do
       req = Helloworld.HelloRequest.new(name: "Elixir")
       {:error, reply} = channel |> Helloworld.Greeter.Stub.say_hello(req)
 
-      assert reply == %GRPC.RPCError{
+      assert %GRPC.RPCError{
                status: GRPC.Status.unauthenticated(),
                message: "Please authenticate"
-             }
+             } == reply
     end)
   end
 
@@ -138,10 +138,11 @@ defmodule GRPC.Integration.ServerTest do
       {:ok, channel} = GRPC.Stub.connect("localhost:#{port}")
       rect = Routeguide.Rectangle.new()
       error = %GRPC.RPCError{message: "Deadline expired", status: 4}
-      assert {:error, ^error} = channel |> Routeguide.RouteGuide.Stub.list_features(rect, timeout: 500)
+
+      assert {:error, ^error} =
+               channel |> Routeguide.RouteGuide.Stub.list_features(rect, timeout: 500)
     end)
   end
-
 
   test "return normally for a little slow server" do
     run_server([SlowServer], fn port ->

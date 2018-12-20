@@ -44,6 +44,14 @@ defmodule GRPC.Stub do
   # 10 seconds
   @default_timeout 10000
 
+  @type rpc_return ::
+          {:ok, struct}
+          | {:ok, struct, map}
+          | GRPC.Client.Stream.t()
+          | {:ok, Enumerable.t()}
+          | {:ok, Enumerable.t(), map}
+          | {:error, GRPC.RPCError.t()}
+
   defmacro __using__(opts) do
     quote bind_quoted: [service_mod: opts[:service]] do
       service_name = service_mod.__meta__(:name)
@@ -51,14 +59,23 @@ defmodule GRPC.Stub do
       Enum.each(service_mod.__rpc_calls__, fn {name, {_, req_stream}, {_, res_stream}} = rpc ->
         func_name = name |> to_string |> Macro.underscore()
         path = "/#{service_name}/#{name}"
+        grpc_type = GRPC.Service.grpc_type(rpc)
+
+        stream = %GRPC.Client.Stream{
+          service_name: service_name,
+          method_name: to_string(name),
+          grpc_type: grpc_type,
+          path: path,
+          rpc: put_elem(rpc, 0, func_name),
+          server_stream: res_stream
+        }
 
         if req_stream do
           def unquote(String.to_atom(func_name))(channel, opts \\ []) do
             GRPC.Stub.call(
               unquote(service_mod),
               unquote(Macro.escape(rpc)),
-              unquote(path),
-              channel,
+              %{unquote(Macro.escape(stream)) | channel: channel},
               nil,
               opts
             )
@@ -68,8 +85,7 @@ defmodule GRPC.Stub do
             GRPC.Stub.call(
               unquote(service_mod),
               unquote(Macro.escape(rpc)),
-              unquote(path),
-              channel,
+              %{unquote(Macro.escape(stream)) | channel: channel},
               request,
               opts
             )
@@ -88,15 +104,24 @@ defmodule GRPC.Stub do
       iex> GRPC.Stub.connect("localhost:50051")
       {:ok, channel}
 
+      iex> GRPC.Stub.connect("/paht/to/unix.sock")
+      {:ok, channel}
+
   ## Options
 
     * `:cred` - a `GRPC.Credential` used to indicate it's a secure connection.
       An insecure connection will be created without this option.
     * `:adapter` - custom client adapter
+    * `:interceptors` - client interceptors
   """
   @spec connect(String.t(), Keyword.t()) :: {:ok, GRPC.Channel.t()} | {:error, any}
   def connect(addr, opts \\ []) when is_binary(addr) and is_list(opts) do
-    [host, port] = String.split(addr, ":")
+    {host, port} =
+      case String.split(addr, ":") do
+        [host, port] -> {host, port}
+        [socket_path] -> {{:local, socket_path}, 0}
+      end
+
     connect(host, port, opts)
   end
 
@@ -116,9 +141,32 @@ defmodule GRPC.Stub do
 
     cred = Keyword.get(opts, :cred)
     scheme = if cred, do: @secure_scheme, else: @insecure_scheme
+    interceptors = Keyword.get(opts, :interceptors, []) |> init_interceptors
 
-    %Channel{host: host, port: port, scheme: scheme, cred: cred, adapter: adapter}
+    %Channel{
+      host: host,
+      port: port,
+      scheme: scheme,
+      cred: cred,
+      adapter: adapter,
+      interceptors: interceptors
+    }
     |> adapter.connect(opts[:adapter_opts])
+  end
+
+  defp init_interceptors(interceptors) do
+    Enum.map(interceptors, fn
+      {interceptor, opts} -> {interceptor, interceptor.init(opts)}
+      interceptor -> {interceptor, interceptor.init([])}
+    end)
+  end
+
+  @doc """
+  Disconnects the adapter and frees any resources the adapter is consuming
+  """
+  @spec disconnect(Channel.t()) :: {:ok, Channel.t()} | {:error, any}
+  def disconnect(%Channel{adapter: adapter} = channel) do
+    adapter.disconnect(channel)
   end
 
   @doc """
@@ -139,41 +187,47 @@ defmodule GRPC.Stub do
       with the last elem being a map of headers `%{headers: headers, trailers: trailers}`(unary) or
       `%{headers: headers}`(server streaming)
   """
-  @spec call(atom, tuple, String.t(), GRPC.Channel, struct | nil, keyword) ::
-          {:ok, struct}
-          | {:ok, struct, map}
-          | GRPC.Client.Stream.t()
-          | {:ok, Enumerable.t()}
-          | {:error, GRPC.RPCError.t()}
-  def call(service_mod, rpc, path, channel, request, opts) do
-    {_, {req_mod, req_stream}, {res_mod, res_stream}} = rpc
+  @spec call(atom, tuple, GRPC.Client.Stream.t(), struct | nil, keyword) :: rpc_return
+  def call(service_mod, rpc, stream, request, opts) do
+    {_, {req_mod, req_stream}, {res_mod, _}} = rpc
     marshal = fn req -> service_mod.marshal(req_mod, req) end
     unmarshal = fn res -> service_mod.unmarshal(res_mod, res) end
 
-    stream = %GRPC.Client.Stream{
-      marshal: marshal,
-      unmarshal: unmarshal,
-      path: path,
-      req_stream: req_stream,
-      res_stream: res_stream,
-      channel: channel
-    }
+    stream = %{stream | marshal: marshal, unmarshal: unmarshal}
 
     opts = parse_req_opts(opts)
 
-    do_call(req_stream, res_stream, stream, request, opts)
+    do_call(req_stream, stream, request, opts)
   end
 
-  defp do_call(false, _, %{marshal: marshal, channel: channel} = stream, request, opts) do
+  defp do_call(false, %{marshal: marshal, channel: channel} = stream, request, opts) do
     message = marshal.(request)
 
-    stream
-    |> channel.adapter.send_request(message, opts)
-    |> recv(opts)
+    last = fn s, r ->
+      s
+      |> channel.adapter.send_request(r, opts)
+      |> recv(opts)
+    end
+
+    next =
+      Enum.reduce(channel.interceptors, last, fn {interceptor, opts}, acc ->
+        fn s, r -> interceptor.call(s, r, acc, opts) end
+      end)
+
+    next.(stream, message)
   end
 
-  defp do_call(true, _, %{channel: channel} = stream, _, opts) do
-    channel.adapter.send_headers(stream, opts)
+  defp do_call(true, %{channel: channel} = stream, req, opts) do
+    last = fn s, _ ->
+      channel.adapter.send_headers(s, opts)
+    end
+
+    next =
+      Enum.reduce(channel.interceptors, last, fn {interceptor, opts}, acc ->
+        fn s, r -> interceptor.call(s, r, acc, opts) end
+      end)
+
+    next.(stream, req)
   end
 
   @doc """
@@ -196,10 +250,8 @@ defmodule GRPC.Stub do
       half_closed state. Default is false.
   """
   @spec send_request(GRPC.Client.Stream.t(), struct, Keyword.t()) :: GRPC.Client.Stream.t()
-  def send_request(%{marshal: marshal, channel: channel} = stream, request, opts \\ []) do
-    message = marshal.(request)
-    send_end_stream = Keyword.get(opts, :end_stream, false)
-    channel.adapter.send_data(stream, message, send_end_stream: send_end_stream)
+  def send_request(%{__interface__: interface} = stream, request, opts \\ []) do
+    interface[:send_request].(stream, request, opts)
   end
 
   @doc """
@@ -255,24 +307,37 @@ defmodule GRPC.Stub do
     * `:return_headers` - when true, headers will be returned.
   """
   @spec recv(GRPC.Client.Stream.t(), keyword | map) ::
-          {:ok, struct} | {:ok, struct, map} | Enumerable.t() | {:error, any}
+          {:ok, struct}
+          | {:ok, struct, map}
+          | {:ok, Enumerable.t()}
+          | {:ok, Enumerable.t(), map}
+          | {:error, any}
   def recv(stream, opts \\ [])
 
   def recv(%{canceled: true}, _) do
     {:error, @canceled_error}
   end
 
-  def recv(stream, opts) when is_list(opts) do
-    recv(stream, parse_recv_opts(opts))
+  def recv(%{__interface__: interface} = stream, opts) do
+    opts =
+      if is_list(opts) do
+        parse_recv_opts(opts)
+      else
+        opts
+      end
+
+    interface[:recv].(stream, opts)
   end
 
-  def recv(%{res_stream: true, channel: channel, payload: payload} = stream, opts) do
+  @doc false
+  def do_recv(%{server_stream: true, channel: channel, payload: payload} = stream, opts) do
     case recv_headers(channel.adapter, channel.adapter_payload, payload, opts) do
       {:ok, headers, is_fin} ->
-        res_enum = case is_fin do
-          :fin -> []
-          :nofin -> response_stream(stream, opts)
-        end
+        res_enum =
+          case is_fin do
+            :fin -> []
+            :nofin -> response_stream(stream, opts)
+          end
 
         if opts[:return_headers] do
           {:ok, res_enum, %{headers: headers}}
@@ -285,8 +350,9 @@ defmodule GRPC.Stub do
     end
   end
 
-  def recv(%{payload: payload, unmarshal: unmarshal, channel: channel}, opts) do
-    with {:ok, headers, _is_fin} <- recv_headers(channel.adapter, channel.adapter_payload, payload, opts),
+  def do_recv(%{payload: payload, unmarshal: unmarshal, channel: channel}, opts) do
+    with {:ok, headers, _is_fin} <-
+           recv_headers(channel.adapter, channel.adapter_payload, payload, opts),
          {:ok, body, trailers} <-
            recv_body(channel.adapter, channel.adapter_payload, payload, opts) do
       {status, msg} = parse_response(body, trailers, unmarshal)
@@ -329,7 +395,11 @@ defmodule GRPC.Stub do
   defp parse_response(data, trailers, unmarshal) do
     case parse_trailers(trailers) do
       :ok ->
-        result = decode_data(data, unmarshal)
+        result =
+          data
+          |> GRPC.Message.from_data()
+          |> unmarshal.()
+
         {:ok, result}
 
       error ->
@@ -347,69 +417,81 @@ defmodule GRPC.Stub do
     end
   end
 
-  defp response_stream(%{unmarshal: unmarshal, channel: channel, payload: payload}, opts) do
-    enum =
-      Stream.unfold(%{buffer: "", message_length: -1, fin: false}, fn
-        %{fin: true} ->
-          nil
+  defp response_stream(
+         %{
+           channel: %{adapter: adapter, adapter_payload: ap},
+           unmarshal: unmarshal,
+           payload: payload
+         },
+         opts
+       ) do
+    state = %{
+      adapter: adapter,
+      adapter_payload: ap,
+      payload: payload,
+      buffer: <<>>,
+      fin: false,
+      need_more: true,
+      opts: opts,
+      unmarshal: unmarshal
+    }
 
-        acc ->
-          case channel.adapter.recv_data_or_trailers(channel.adapter_payload, payload, opts) do
-            {:data, data} ->
-              if GRPC.Message.complete?(data) do
-                reply = decode_data(data, unmarshal)
-                {{:ok, reply}, %{buffer: "", message_length: -1}}
-              else
-                handle_incomplete_data(acc, data, unmarshal)
+    Stream.unfold(state, fn s -> read_stream(s) end)
+  end
+
+  defp read_stream(%{buffer: <<>>, fin: true, fin_resp: nil}), do: nil
+
+  defp read_stream(%{buffer: <<>>, fin: true, fin_resp: fin_resp} = s),
+    do: {fin_resp, Map.put(s, :fin_resp, nil)}
+
+  defp read_stream(
+         %{
+           adapter: adapter,
+           adapter_payload: ap,
+           payload: payload,
+           buffer: buffer,
+           need_more: true,
+           opts: opts
+         } = s
+       ) do
+    case adapter.recv_data_or_trailers(ap, payload, opts) do
+      {:data, data} ->
+        buffer = buffer <> data
+        new_s = s |> Map.put(:need_more, false) |> Map.put(:buffer, buffer)
+        read_stream(new_s)
+
+      {:trailers, trailers} ->
+        trailers = GRPC.Transport.HTTP2.decode_headers(trailers)
+
+        case parse_trailers(trailers) do
+          :ok ->
+            fin_resp =
+              if opts[:return_headers] do
+                {:trailers, trailers}
               end
 
-            {:trailers, trailers} ->
-              trailers = GRPC.Transport.HTTP2.decode_headers(trailers)
+            new_s = s |> Map.put(:fin, true) |> Map.put(:fin_resp, fin_resp)
+            read_stream(new_s)
 
-              case parse_trailers(trailers) do
-                :ok ->
-                  if opts[:return_headers] do
-                    {{:trailers, trailers}, Map.put(acc, :fin, true)}
-                  end
+          error ->
+            {error, %{buffer: <<>>, fin: true, fin_resp: nil}}
+        end
 
-                error ->
-                  {error, Map.put(acc, :fin, true)}
-              end
-
-            error = {:error, _} ->
-              {error, Map.put(acc, :fin, true)}
-          end
-      end)
-
-    Stream.reject(enum, &match?(:skip, &1))
+      error = {:error, _} ->
+        {error, %{buffer: <<>>, fin: true, fin_resp: nil}}
+    end
   end
 
-  defp handle_incomplete_data(%{buffer: ""} = acc, data, _) do
-    new_acc =
-      acc
-      |> Map.put(:buffer, data)
-      |> Map.put(:message_length, GRPC.Message.message_length(data))
+  defp read_stream(%{buffer: buffer, need_more: false, unmarshal: unmarshal} = s) do
+    case GRPC.Message.get_message(buffer) do
+      {message, rest} ->
+        reply = unmarshal.(message)
+        new_s = Map.put(s, :buffer, rest)
+        {{:ok, reply}, new_s}
 
-    {:skip, new_acc}
-  end
-
-  defp handle_incomplete_data(%{buffer: buffer, message_length: ml}, data, unmarshal)
-       when byte_size(buffer) + byte_size(data) - 5 == ml and ml > 0 do
-    final_buffer = buffer <> data
-
-    reply = decode_data(final_buffer, unmarshal)
-
-    {{:ok, reply}, %{buffer: "", message_length: -1}}
-  end
-
-  defp handle_incomplete_data(%{buffer: buffer} = acc, data, _) do
-    {:skip, Map.put(acc, :buffer, buffer <> data)}
-  end
-
-  defp decode_data(data, unmarshal) do
-    data
-    |> GRPC.Message.from_data()
-    |> unmarshal.()
+      _ ->
+        read_stream(Map.put(s, :need_more, true))
+    end
   end
 
   defp parse_req_opts(list) when is_list(list) do
